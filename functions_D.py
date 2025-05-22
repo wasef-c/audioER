@@ -26,6 +26,39 @@ from PIL import Image
 # Device Configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+windows = [
+    # (0, 0, 112, 147),       # Top-MID left
+
+    (0, 0, 112, 75),       # Top-left
+    # (112, 0, 224, 75),     # Top-right
+
+    (0, 75, 112, 147),     # mid left
+    # (112, 75, 224, 147),     # Middle-right
+
+
+    (0, 149, 112, 224),   # bot left
+    # (112, 149, 224, 224),   # bot right
+    # None , 
+    # None, 
+    # None                   # Entire image
+]
+
+new_size = 224
+size = 224
+
+class RandomWindowCrop:
+    def __init__(self, windows, output_size):
+        self.windows = windows
+        self.output_size = output_size
+
+    def __call__(self, img):
+        window = random.choice(self.windows)
+        if window is not None:
+            cropped_img = img.crop(window)
+        else:
+            cropped_img = img
+        return cropped_img.resize((self.output_size, self.output_size), Image.BILINEAR)
+    
 # Data Transformations
 def get_transforms(new_size=224):
     return Compose([
@@ -102,6 +135,7 @@ _train_transforms = Compose([
     Resize((224, 224)),
     # RandomMasking(max_mask_patches=8, mask_ratio=0.05),  # Add random masking
     # ColorJitter(brightness=0.1, contrast=0.1, saturation=0, hue=0),
+    RandomWindowCrop(windows, size),
     ToTensor(),
     # Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -109,6 +143,7 @@ _train_transforms = Compose([
 _val_transforms = Compose([
     Resize((224, 224)),
     ToTensor(),
+    RandomWindowCrop(windows, size),
     # Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 ])
@@ -184,25 +219,67 @@ class CustomDataset(Dataset):
     def __getitem__(self, idx):
         return self.dataset[idx]
 
-# GEM Pooling for feature extraction
+# # GEM Pooling for feature extraction
+# class GeMPooling(nn.Module):
+#     def __init__(self, p=3, eps=1e-6):
+#         super(GeMPooling, self).__init__()
+#         self.p = nn.Parameter(torch.ones(1) * p)
+#         self.eps = eps
+
+#     def forward(self, x):
+#         # Permute to (batch_size, channels, height, width)
+#         if x.dim() == 3:
+#             patch_dim = int((x.size(1) - 1) ** 0.5)  # Calculate grid size
+#             x = x[:, 1:, :]  # Remove classification token if present
+#             # Reshape to [batch_size, height, width, channels]
+#             x = x.view(x.size(0), patch_dim, patch_dim, x.size(2))
+
+#         x = x.permute(0, 3, 1, 2)
+#         # Apply GeM pooling
+#         pooled = torch.mean(x.clamp(min=self.eps).pow(
+#             self.p), dim=(2, 3)).pow(1.0 / self.p)
+#         return pooled
+
+
+
 class GeMPooling(nn.Module):
     def __init__(self, p=3, eps=1e-6):
         super(GeMPooling, self).__init__()
         self.p = nn.Parameter(torch.ones(1) * p)
         self.eps = eps
-
+        
     def forward(self, x):
-        # Permute to (batch_size, channels, height, width)
-        if x.dim() == 3:
-            patch_dim = int((x.size(1) - 1) ** 0.5)  # Calculate grid size
-            x = x[:, 1:, :]  # Remove classification token if present
+        # Handle ViT-like input (sequence of tokens)
+        if x.dim() == 3:  # [batch_size, sequence_length, hidden_dim]
+            batch_size, seq_len, hidden_dim = x.shape
+            
+            # Print debug info
+            # print(f"Input shape: {x.shape}")
+            
+            # Remove CLS token if present
+            if seq_len > 1:
+                x = x[:, 1:, :]
+                seq_len = seq_len - 1
+            
+            # print(f"After CLS removal: {x.shape}")
+            
+            # Calculate height and width for reshaping
+            # Find the factors of seq_len that are closest to making a square
+            h = int(math.sqrt(seq_len))
+            while seq_len % h != 0:
+                h -= 1
+            w = seq_len // h
+            
+            # print(f"Reshaping to: [{batch_size}, {h}, {w}, {hidden_dim}]")
+            
             # Reshape to [batch_size, height, width, channels]
-            x = x.view(x.size(0), patch_dim, patch_dim, x.size(2))
-
-        x = x.permute(0, 3, 1, 2)
+            x = x.view(batch_size, h, w, hidden_dim)
+            
+            # Permute to [batch_size, channels, height, width]
+            x = x.permute(0, 3, 1, 2)
+        
         # Apply GeM pooling
-        pooled = torch.mean(x.clamp(min=self.eps).pow(
-            self.p), dim=(2, 3)).pow(1.0 / self.p)
+        pooled = torch.mean(x.clamp(min=self.eps).pow(self.p), dim=(2, 3)).pow(1.0 / self.p)
         return pooled
 
 # Loss Functions
@@ -377,16 +454,16 @@ class BalancedCrossEntropyWithContrastiveLoss(nn.Module):
         self.class_weight_multipliers = class_weight_multipliers
         self.centers = nn.Parameter(torch.randn(num_classes, feature_dim))
 
-        self.log_var_ce = nn.Parameter(torch.tensor([-0.5]))
-        self.log_var_contrastive = nn.Parameter(torch.tensor([1.6]))
-        self.log_var_balance = nn.Parameter(torch.tensor([-0.6]))
+        self.log_var_ce = nn.Parameter(torch.tensor([-2.0]))
+        self.log_var_contrastive = nn.Parameter(torch.tensor([3.0]))
+        self.log_var_balance = nn.Parameter(torch.tensor([-1.6]))
         
         # Base gamma parameter for focal loss
         self.base_gamma = nn.Parameter(torch.tensor([5.1]))
         
         # Class-specific adaptive parameters
         # Initialize with different values for each class
-        self.class_gammas = nn.Parameter(torch.tensor([1.3,2.0,1.0,1.0]))
+        self.class_gammas = nn.Parameter(torch.tensor([1.4,1.8,1.0,1.0]))
         
         # Initialize class weights as learnable parameters
         self.class_weights = nn.Parameter(torch.ones(num_classes))
@@ -395,6 +472,8 @@ class BalancedCrossEntropyWithContrastiveLoss(nn.Module):
             self.class_weights = nn.Parameter(torch.tensor(class_weight_multipliers))
         else:
             self.class_weights = nn.Parameter(torch.ones(num_classes))
+        self.temperature = nn.Parameter(torch.tensor([0.07]))
+
     
     def compute_class_accuracies(self, logits, targets,  class_weights=None):
         """Compute per-class accuracies for the current batch."""
@@ -446,6 +525,7 @@ class BalancedCrossEntropyWithContrastiveLoss(nn.Module):
         
         # Rest of your existing loss computation
         # Contrastive loss calculation
+        '''
         centers_batch = self.centers[targets]
         intra_class_distance = torch.norm(features - centers_batch, p=2, dim=1)
         
@@ -458,7 +538,49 @@ class BalancedCrossEntropyWithContrastiveLoss(nn.Module):
         
         inter_class_distance = torch.mean(torch.stack(center_distances)) if center_distances else torch.tensor(0.0).to(device)
         contrastive_loss = intra_class_distance.mean() + 0.001 * torch.norm(self.centers, p=2).mean() - torch.log(inter_class_distance + 1e-8)
-        
+        '''
+        centers_batch = self.centers[targets]
+        # Use squared L2 norm for numeric stability
+        intra_class_distance = torch.pow(torch.norm(features - centers_batch, p=2, dim=1), 2)
+
+        # Better negative sampling strategy
+        neg_distances = []
+        hardest_negatives = []
+        for idx, feat in enumerate(features):
+            curr_class = targets[idx]
+            # Calculate distances to all other class centers
+            other_centers = [c for c in range(self.num_classes) if c != curr_class]
+            
+            if other_centers:
+                # Get distances to all negative centers
+                all_neg_dists = torch.stack([
+                    torch.exp(-self.temperature * torch.norm(feat - self.centers[c], p=2)) 
+                    for c in other_centers
+                ])
+                
+                # Track average negative distance
+                neg_distances.append(torch.mean(all_neg_dists))
+                
+                # Track hardest negative (closest negative center)
+                hardest_neg_dist = torch.max(all_neg_dists)
+                hardest_negatives.append(hardest_neg_dist)
+
+        # Combine regular and hard negative mining
+        neg_distance_mean = torch.mean(torch.stack(neg_distances)) if neg_distances else torch.tensor(0.0).to(device)
+        hardest_neg_mean = torch.mean(torch.stack(hardest_negatives)) if hardest_negatives else torch.tensor(0.0).to(device)
+
+        # Weight the hardest negatives more heavily
+        inter_class_distance = 0.7 * neg_distance_mean + 0.3 * hardest_neg_mean
+
+        # Add temperature scaling for better gradient properties
+        intra_class_distance = intra_class_distance * self.temperature
+
+        # Improved center regularization with margin
+        center_reg = 0.0005 * torch.norm(self.centers, p=2).mean()
+        center_variance = 0.001 * torch.var(self.centers, dim=0).mean()  # Encourage spread out centers
+
+        # Final contrastive loss with better numerical stability
+        contrastive_loss = intra_class_distance.mean() + center_reg + center_variance - torch.log(inter_class_distance + 1e-8)
         # Balance loss calculation
         class_accuracies = self.compute_class_accuracies(logits, targets)
         accuracy_weight_correlation = -torch.sum(class_accuracies * combined_weights[:len(class_accuracies)]) / len(class_accuracies)
@@ -484,9 +606,9 @@ class BalancedCrossEntropyWithContrastiveLoss(nn.Module):
             'log_var_ce': self.log_var_ce.item(),
             'log_var_contrastive': self.log_var_contrastive.item(),
             'log_var_balance': self.log_var_balance.item(),
-            'weight_ce': precision_ce.item(),
-            'weight_contrastive': precision_contrastive.item(),
-            'weight_balance': precision_balance.item(),
+            'weight_ce': weighted_ce.item(),
+            'weight_contrastive': weighted_contrastive.item(),
+            'weight_balance': weighted_balance.item(),
             'base_gamma': self.base_gamma.item(),
             'class_weights': [w.item() for w in self.class_weights],
             'class_gammas': [g.item() for g in self.class_gammas]
@@ -502,7 +624,7 @@ class DiNATWithFeatures(nn.Module):
         
         # Feature extraction and classification layers
         self.features = nn.Sequential(
-            nn.Linear(512, 768),
+            nn.Linear(feature_dim, 768),
             nn.LayerNorm(768),
             nn.ReLU(),
             nn.Dropout(0.2),  # Add dropout for regularization
@@ -511,7 +633,7 @@ class DiNATWithFeatures(nn.Module):
         )
         
         # Replace the classifier in DiNAT
-        self.dinat.classifier = nn.Linear(512, num_classes)
+        self.dinat.classifier = nn.Linear(feature_dim, num_classes)
 
         
 
